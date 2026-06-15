@@ -177,13 +177,17 @@ public struct CoreAISegmentationEngine {
                 "No array descriptor for image or point inputs"
             )
         }
+        // Single placeholder query so `sliceUserQueries(userQueryCount: 1)` produces a
+        // non-zero-sized output shape — `[B, 0, H, W]` would fail NDArray construction.
+        // Coordinates and image size don't matter; warmup discards the result.
+        let warmupQuery = PointQuery(points: [.init(x: 0, y: 0, label: .foreground)])
         try await runPointInference(
             inputs: [
                 imageInputName: NDArray(descriptor: imageDescriptor),
                 pointsInputName: NDArray(descriptor: pointsDescriptor),
                 pointLabelsInputName: NDArray(descriptor: labelsDescriptor),
             ],
-            pointQuery: PointQuery(),
+            pointQuery: warmupQuery,
             imageSize: .zero
         )
     }
@@ -474,13 +478,11 @@ public struct CoreAISegmentationEngine {
         }
 
         return SegmentationOutput(
-            predictedMasks: flattenAsFloat(masks),
-            masksShape: masks.shape,
+            predictedMasks: masks,
             predictedBoxes: flattenAsFloat(boxes),
             predictedLogits: flattenAsFloat(logits),
             presenceLogits: flattenAsFloat(presence),
-            semanticSegment: flattenAsFloat(semantic),
-            semanticSegmentShape: semantic.shape
+            semanticSegment: semantic
         )
     }
 
@@ -514,20 +516,17 @@ public struct CoreAISegmentationEngine {
         // segments from EfficientSAM's `invalid_points` embedding. `pointQuery` here is
         // the resolved query — its count equals the user's queries (or the segment-
         // everything grid, which fully fills Q anyway).
-        let (predictedMasks, masksShape, predictedScores) = Self.sliceUserQueries(
+        let (predictedMasksFlat, masksShape, predictedScores) = Self.sliceUserQueries(
             flatMasks: bestMasks, flatScores: bestScores,
             shape: bestShape, userQueryCount: pointQuery.queries.count
         )
+        var predictedMasks = NDArray(shape: masksShape, scalarType: .float32)
+        fillNDArray(&predictedMasks, as: Float.self, with: predictedMasksFlat)
         let predictedBoxes = Self.extractBoxesFromPointQuery(pointQuery, imageSize: imageSize)
         return SegmentationOutput(
             predictedMasks: predictedMasks,
-            masksShape: masksShape,
-            predictedBoxes: predictedBoxes,
-            predictedLogits: [],
-            predictedScores: predictedScores,
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedBoxes: predictedBoxes.isEmpty ? nil : predictedBoxes,
+            predictedScores: predictedScores
         )
     }
 
@@ -538,13 +537,13 @@ public struct CoreAISegmentationEngine {
         masks: NDArray, scores: NDArray
     ) throws -> (masks: [Float], shape: [Int], scores: [Float]) {
         let masksShape = masks.shape
-        let allMasks = flattenAsFloat(masks)
-        let allScores = flattenAsFloat(scores)
         guard masksShape.count == 5 else {
             throw SegmentationRuntimeError.invalidConfiguration(
                 "Point inference expected [B, Q, K, H, W] masks; got rank \(masksShape.count) shape \(masksShape)."
             )
         }
+        let allMasks = flattenAsFloat(masks)
+        let allScores = flattenAsFloat(scores)
         return Self.reduceBestOfK(flatMasks: allMasks, flatScores: allScores, shape: masksShape)
     }
 

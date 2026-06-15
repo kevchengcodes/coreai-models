@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
+import CoreAIShared
 import CoreGraphics
 import Foundation
 import Testing
@@ -11,6 +13,14 @@ import Testing
 
 @Suite("Image Segmentation")
 struct ImageSegmentationTests {
+    /// Build a Float32 NDArray from a flat `[Float]` row-major payload.
+    /// `values.count` must equal `shape.reduce(1, *)`.
+    private static func ndarray(_ values: [Float], shape: [Int]) -> NDArray {
+        var array = NDArray(shape: shape, scalarType: .float32)
+        fillNDArray(&array, as: Float.self, with: values)
+        return array
+    }
+
     // MARK: - PointQuery
 
     @Test("PointQuery: empty init is segment-everything")
@@ -65,16 +75,11 @@ struct ImageSegmentationTests {
     @Test("Decode: predictedScores override sigmoid(logits) path")
     func decodeUsesPredictedScoresWhenPresent() {
         // Two queries; predictedScores are *already* in [0, 1]. The presence logit is also
-        // provided but should be ignored when predictedScores is non-empty.
+        // provided but should be ignored when predictedScores is non-nil.
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 2 * 2 * 2),
-            masksShape: [1, 2, 2, 2],
-            predictedBoxes: [],  // EfficientSAM-style: no model-emitted boxes
-            predictedLogits: [],
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 8), shape: [1, 2, 2, 2]),
             predictedScores: [0.9, 0.4],
-            presenceLogits: [-10.0],  // would zero scores via sigmoid if we used the SAM3 path
-            semanticSegment: [],
-            semanticSegmentShape: []
+            presenceLogits: [-10.0]  // would zero scores via sigmoid if we used the SAM3 path
         )
 
         let response = SegmentationPostprocessor.decode(
@@ -86,7 +91,7 @@ struct ImageSegmentationTests {
         #expect(response.segments.count == 2)
         #expect(abs(response.segments[0].score - 0.9) < 1e-5)
         #expect(abs(response.segments[1].score - 0.4) < 1e-5)
-        // Empty predictedBoxes → CGRect.zero.
+        // Nil predictedBoxes → CGRect.zero.
         #expect(response.segments[0].box == .zero)
     }
 
@@ -98,13 +103,9 @@ struct ImageSegmentationTests {
         let expectedScore = SegmentationPostprocessor.sigmoid(logit)
 
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 1 * 2 * 2),
-            masksShape: [1, 1, 2, 2],
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 4), shape: [1, 1, 2, 2]),
             predictedBoxes: [0.0, 0.0, 1.0, 1.0],
-            predictedLogits: [logit],
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedLogits: [logit]
         )
 
         let response = SegmentationPostprocessor.decode(
@@ -119,13 +120,9 @@ struct ImageSegmentationTests {
     @Test("Decode: segments sorted by score descending")
     func decodeScoresSortedDescending() {
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 2 * 2 * 2),
-            masksShape: [1, 2, 2, 2],
-            predictedBoxes: [Float](repeating: 0, count: 1 * 2 * 4),
-            predictedLogits: [-2.0, 2.0],
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 8), shape: [1, 2, 2, 2]),
+            predictedBoxes: [Float](repeating: 0, count: 8),
+            predictedLogits: [-2.0, 2.0]
         )
 
         let response = SegmentationPostprocessor.decode(
@@ -141,13 +138,9 @@ struct ImageSegmentationTests {
     @Test("Decode: maxSegments caps output count")
     func decodeMaxSegmentsLimitsOutput() {
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 3 * 2 * 2),
-            masksShape: [1, 3, 2, 2],
-            predictedBoxes: [Float](repeating: 0, count: 1 * 3 * 4),
-            predictedLogits: [1.0, 2.0, 3.0],
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 12), shape: [1, 3, 2, 2]),
+            predictedBoxes: [Float](repeating: 0, count: 12),
+            predictedLogits: [1.0, 2.0, 3.0]
         )
 
         let response = SegmentationPostprocessor.decode(
@@ -159,37 +152,12 @@ struct ImageSegmentationTests {
         #expect(response.segments.count == 1)
     }
 
-    @Test("Decode: undersized predictedMasks bails out with empty response (no crash)")
-    func decodeUndersizedMasksBailsOut() {
-        // shape claims [1, 2, 3, 3] = 18 floats, but predictedMasks only has 4.
-        let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 4),
-            masksShape: [1, 2, 3, 3],
-            predictedBoxes: [],
-            predictedLogits: [0.5, 0.5],
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
-        )
-        let response = SegmentationPostprocessor.decode(
-            output: output,
-            inputSize: CGSize(width: 4, height: 4)
-        )
-        #expect(response.segments.isEmpty)
-    }
-
     @Test("Decode: undersized predictedScores bails out (direct-scores path)")
     func decodeUndersizedScoresBailsOut() {
         // shape implies queryCount=2 but predictedScores has only 1.
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 2 * 2 * 2),
-            masksShape: [1, 2, 2, 2],
-            predictedBoxes: [],
-            predictedLogits: [],
-            predictedScores: [0.9],  // missing slot for q=1
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 8), shape: [1, 2, 2, 2]),
+            predictedScores: [0.9]  // missing slot for q=1
         )
         let response = SegmentationPostprocessor.decode(
             output: output,
@@ -198,17 +166,13 @@ struct ImageSegmentationTests {
         #expect(response.segments.isEmpty)
     }
 
-    @Test("Decode: undersized predictedBoxes (non-empty but short) bails out")
+    @Test("Decode: undersized predictedBoxes (non-nil but short) bails out")
     func decodeUndersizedBoxesBailsOut() {
         // queryCount=2 → expects 8 box floats; only 4 provided.
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 2 * 2 * 2),
-            masksShape: [1, 2, 2, 2],
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 8), shape: [1, 2, 2, 2]),
             predictedBoxes: [0, 0, 1, 1],
-            predictedLogits: [0.5, 0.5],
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedLogits: [0.5, 0.5]
         )
         let response = SegmentationPostprocessor.decode(
             output: output,
@@ -217,17 +181,11 @@ struct ImageSegmentationTests {
         #expect(response.segments.isEmpty)
     }
 
-    @Test("Decode: predictedBoxes.isEmpty is fine (EfficientSAM path)")
+    @Test("Decode: predictedBoxes nil is fine (EfficientSAM path)")
     func decodeEmptyBoxesAllowed() {
         let output = SegmentationOutput(
-            predictedMasks: [Float](repeating: 0, count: 1 * 1 * 2 * 2),
-            masksShape: [1, 1, 2, 2],
-            predictedBoxes: [],  // EfficientSAM: no boxes
-            predictedLogits: [],
-            predictedScores: [0.7],
-            presenceLogits: [],
-            semanticSegment: [],
-            semanticSegmentShape: []
+            predictedMasks: Self.ndarray([Float](repeating: 0, count: 4), shape: [1, 1, 2, 2]),
+            predictedScores: [0.7]
         )
         let response = SegmentationPostprocessor.decode(
             output: output,

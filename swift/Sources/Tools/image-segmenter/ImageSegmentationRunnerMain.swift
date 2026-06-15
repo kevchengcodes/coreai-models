@@ -280,11 +280,11 @@ struct ImageSegmenterCLI: AsyncParsableCommand {
             metricRow(name: "pixel_values", actual: actualPixelValues, ref: try refPixelValues.asFloat()),
         ]
         for (name, actual) in [
-            ("pred_masks", output.predictedMasks),
-            ("pred_boxes", output.predictedBoxes),
-            ("pred_logits", output.predictedLogits),
-            ("presence_logits", output.presenceLogits),
-            ("semantic_seg", output.semanticSegment),
+            ("pred_masks", flattenAsFloat(output.predictedMasks)),
+            ("pred_boxes", output.predictedBoxes ?? []),
+            ("pred_logits", output.predictedLogits ?? []),
+            ("presence_logits", output.presenceLogits ?? []),
+            ("semantic_seg", output.semanticSegment.map(flattenAsFloat) ?? []),
         ] {
             let ref = try NpyArray.load(dataDir.appendingPathComponent("ref_\(name).npy")).asFloat()
             rows.append(metricRow(name: name, actual: actual, ref: ref))

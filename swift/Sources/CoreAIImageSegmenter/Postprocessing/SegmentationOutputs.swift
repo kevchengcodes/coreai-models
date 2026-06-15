@@ -3,6 +3,8 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
+import CoreAIShared
 import CoreGraphics
 import Foundation
 
@@ -94,72 +96,62 @@ public struct Segment: Sendable {
     }
 }
 
-/// Raw decoded outputs from a segmentation engine — engine-agnostic Float arrays.
+/// Raw decoded outputs from a segmentation engine.
 ///
-/// All tensors are flattened in C (row-major) order. This type is an intermediate
-/// representation produced by `SegmentationEngine` implementations and consumed by
-/// `SegmentationPostprocessor.decode(output:inputSize:parameters:)`.
+/// Big tensors (`predictedMasks`, `semanticSegment`) flow through as NDArrays — the
+/// postprocessor reads them via typed-pointer views with no upfront flatten. Smaller
+/// per-query tensors (boxes, logits, scores, presence — all `B*Q`-sized) are flat
+/// `[Float]` arrays; engines flatten them at the boundary.
 ///
 /// ## Adding outputs for a new model
 ///
 /// If your model produces outputs that don't fit the existing fields (e.g. panoptic IDs,
 /// depth estimates), add a new optional field here and handle it in
-/// `SegmentationPostprocessor.decode`. Keep new fields optional (`[Float]`, default `[]`)
-/// so existing engines don't need changes.
+/// `SegmentationPostprocessor.decode`.
 public struct SegmentationOutput: Sendable {
-    /// Flat mask logits before sigmoid, shape `[batch, queryCount, maskHeight, maskWidth]`.
-    public let predictedMasks: [Float]
+    /// Mask logits before sigmoid, shape `[batch, queryCount, maskHeight, maskWidth]`.
+    public let predictedMasks: NDArray
 
-    /// Shape of `predictedMasks`: `[batch, queryCount, maskHeight, maskWidth]`.
-    public let masksShape: [Int]
-
-    /// Flat bounding-box coordinates, shape `[batch, queryCount, 4]`, XYXY normalized to [0, 1].
-    /// Empty (`[]`) when the model produces no box output (e.g. EfficientSAM); the postprocessor
+    /// Bounding-box coordinates, flat `[batch * queryCount * 4]`, XYXY normalized to [0, 1].
+    /// `nil` when the model produces no box output (e.g. EfficientSAM); the postprocessor
     /// uses `CGRect.zero` for those segments.
-    public let predictedBoxes: [Float]
+    public let predictedBoxes: [Float]?
 
-    /// Flat per-query classification logits before sigmoid, shape `[batch, queryCount]`.
-    /// Empty (`[]`) when `predictedScores` is provided instead.
-    public let predictedLogits: [Float]
+    /// Per-query classification logits before sigmoid, flat `[batch * queryCount]`.
+    /// `nil` when `predictedScores` is provided instead.
+    public let predictedLogits: [Float]?
 
-    /// Flat per-query confidence scores already in [0, 1], shape `[batch, queryCount]`.
-    /// When non-empty these are used directly as segment scores, bypassing
+    /// Per-query confidence scores already in [0, 1], flat `[batch * queryCount]`.
+    /// When non-nil these are used directly as segment scores, bypassing
     /// `sigmoid(predictedLogits) × sigmoid(presenceLogit)`. Used by models such as EfficientSAM
     /// that output IOU scores rather than raw logits.
-    public let predictedScores: [Float]
+    public let predictedScores: [Float]?
 
-    /// Flat presence logit before sigmoid, shape `[batch, 1]`.
-    /// Empty (`[]`) when the model has no presence head; treated as 1.0 by the postprocessor.
-    public let presenceLogits: [Float]
+    /// Presence logit before sigmoid, flat `[batch]`.
+    /// `nil` when the model has no presence head; treated as 1.0 by the postprocessor.
+    public let presenceLogits: [Float]?
 
-    /// Flat semantic segmentation logits, shape `[batch, 1, height, width]`.
+    /// Semantic segmentation logits, shape `[batch, 1, height, width]`.
     ///
     /// Populated by `CoreAISegmentationEngine` when the model exposes a tensor named
     /// `"semanticSegment"`. Decoded by `SegmentationPostprocessor` into
-    /// `SegmentationResponse.probabilityMap`. Empty (`[]`) when the model has no semantic head.
-    public let semanticSegment: [Float]
-
-    /// Shape of `semanticSegment`: `[batch, 1, height, width]`. Empty when `semanticSegment` is empty.
-    public let semanticSegmentShape: [Int]
+    /// `SegmentationResponse.probabilityMap`. `nil` when the model has no semantic head.
+    public let semanticSegment: NDArray?
 
     public init(
-        predictedMasks: [Float],
-        masksShape: [Int],
-        predictedBoxes: [Float],
-        predictedLogits: [Float],
-        predictedScores: [Float] = [],
-        presenceLogits: [Float],
-        semanticSegment: [Float],
-        semanticSegmentShape: [Int]
+        predictedMasks: NDArray,
+        predictedBoxes: [Float]? = nil,
+        predictedLogits: [Float]? = nil,
+        predictedScores: [Float]? = nil,
+        presenceLogits: [Float]? = nil,
+        semanticSegment: NDArray? = nil
     ) {
         self.predictedMasks = predictedMasks
-        self.masksShape = masksShape
         self.predictedBoxes = predictedBoxes
         self.predictedLogits = predictedLogits
         self.predictedScores = predictedScores
         self.presenceLogits = presenceLogits
         self.semanticSegment = semanticSegment
-        self.semanticSegmentShape = semanticSegmentShape
     }
 }
 
