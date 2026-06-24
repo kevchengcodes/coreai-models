@@ -27,7 +27,15 @@ struct SpeechRunner: AsyncParsableCommand {
 
     func run() async throws {
         let bundleURL = URL(fileURLWithPath: modelPath)
-        if FileManager.default.fileExists(atPath: bundleURL.appending(path: "encoder.aimodel").path) {
+        // .aimodel/.aimodelc/.aimodelx are themselves Core AI assets, not bundle
+        // directories — route them through the legacy single-asset path even though
+        // they're directories on disk.
+        let ext = bundleURL.pathExtension.lowercased()
+        let isAssetPath = (ext == "aimodel" || ext == "aimodelc" || ext == "aimodelx")
+        let fm = FileManager.default
+        let hasMetadata = fm.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
+        let hasEncoder = fm.fileExists(atPath: bundleURL.appending(path: "encoder.aimodel").path)
+        if !isAssetPath && (hasMetadata || hasEncoder) {
             try await runBundle(bundleURL: bundleURL, audioPath: audioPath)
         } else {
             try await runLegacy(modelPath: modelPath, audioPath: audioPath)
@@ -38,8 +46,8 @@ struct SpeechRunner: AsyncParsableCommand {
 // MARK: - Split bundle via CoreAISpeech
 
 func runBundle(bundleURL: URL, audioPath: String?) async throws {
-    print("Format: split (encoder + decoder, KV cache)")
     let model = try await SpeechModel(resourcesAt: bundleURL)
+    print("Format: bundle (\(await model.architecture))")
 
     if let path = audioPath {
         let url = URL(fileURLWithPath: path)
