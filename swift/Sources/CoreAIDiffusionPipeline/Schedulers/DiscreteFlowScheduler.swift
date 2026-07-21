@@ -37,28 +37,42 @@ public final class DiscreteFlowScheduler {
         self.mu = mu
         self.counter = 0
 
-        // Lower bound of the pre-shift sigma linspace. Diffusers builds
-        //   sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        // (pipeline_flux2_klein.py) and passes it to
-        // FlowMatchEulerDiscreteScheduler.set_timesteps, which uses the provided
-        // sigmas as-is and only applies the mu/shift transform — it does NOT
-        // recompute the endpoints from num_train_timesteps. So the floor must be
-        // 1/stepCount for BOTH the dynamic-shift (mu) and static-shift paths.
-        // Using 1/trainStepCount here collapsed the final sigma to ~0 at low step
-        // counts (e.g. 4-step Klein), wasting the last step and misplacing all
-        // intermediate noise levels.
-        let sigmaMin: Float = 1.0 / Float(stepCount)
-        var inferSigmas: [Float] = linspace(sigmaMax, sigmaMin, stepCount)
-
+        // Build the inference sigma schedule to match diffusers 0.37.1
+        // FlowMatchEulerDiscreteScheduler. The two shift modes use *different*
+        // reference constructions, so they must not share a floor:
+        //
+        //  • Dynamic shift (mu != nil) — FLUX.2 klein. The klein pipeline builds
+        //    sigmas EXTERNALLY as np.linspace(1.0, 1/num_inference_steps, steps)
+        //    and passes them to set_timesteps(sigmas:mu:), which only applies the
+        //    exponential time-shift — it does NOT recompute the endpoints. Floor
+        //    is therefore 1/stepCount. (Using 1/trainStepCount here collapsed the
+        //    final sigma to ~0 at low step counts, e.g. 4-step klein.)
+        //
+        //  • Static shift (mu == nil) — SD3. set_timesteps builds sigmas
+        //    INTERNALLY: __init__ pre-shifts linspace(1.0 … 1/num_train_timesteps)
+        //    by the static shift and records sigma_min/sigma_max from the result;
+        //    set_timesteps then re-derives linspace(sigma_max … sigma_min) and
+        //    applies the static shift AGAIN. So the floor derives from
+        //    num_train_timesteps (NOT num_inference_steps) and the shift is
+        //    applied twice. Using 1/stepCount + a single shift here left SD3 far
+        //    from fully denoised at the final step (e.g. last sigma ~0.25 vs
+        //    diffusers ~0.009 at 10 steps).
+        var inferSigmas: [Float]
         if let mu {
+            let sigmaMin: Float = 1.0 / Float(stepCount)
             let expMu = expf(mu)
-            inferSigmas = inferSigmas.map { sigma in
+            inferSigmas = linspace(sigmaMax, sigmaMin, stepCount).map { sigma in
                 expMu / (expMu + (1.0 / sigma - 1.0))
             }
-        } else if timeStepShift != 1.0 {
-            inferSigmas = inferSigmas.map { sigma in
-                timeStepShift * sigma / (1.0 + (timeStepShift - 1.0) * sigma)
+        } else {
+            func staticShift(_ s: Float) -> Float {
+                timeStepShift == 1.0 ? s : timeStepShift * s / (1.0 + (timeStepShift - 1.0) * s)
             }
+            // Endpoints are the already-shifted __init__ sigmas; the schedule is
+            // then shifted a second time (diffusers set_timesteps).
+            let top = staticShift(sigmaMax)
+            let floor = staticShift(1.0 / Float(trainStepCount))
+            inferSigmas = linspace(top, floor, stepCount).map(staticShift)
         }
 
         let ts = trainSteps
