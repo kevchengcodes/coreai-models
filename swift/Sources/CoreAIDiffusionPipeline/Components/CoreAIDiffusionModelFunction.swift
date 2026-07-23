@@ -12,7 +12,9 @@ import Foundation
 public actor CoreAIDiffusionModelFunction {
     private let modelURL: URL
     private var model: AIModel?
-    private var function: InferenceFunction?
+    /// Cached InferenceFunctions keyed by name. Reusing loaded functions (rather
+    /// than reloading per call) avoids a GPU memory leak — see PR #110.
+    private var functionCache: [String: InferenceFunction] = [:]
     private var isLoaded = false
 
     public init(modelURL: URL) {
@@ -26,25 +28,54 @@ public actor CoreAIDiffusionModelFunction {
 
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let loadedModel = try await AIModel(contentsOf: modelURL, options: options)
+        self.model = loadedModel
         guard let fn = try loadedModel.loadFunction(named: "main") else {
             throw CoreAIDiffusionError.functionNotFound("main", modelURL)
         }
 
-        self.model = loadedModel
-        self.function = fn
+        self.functionCache["main"] = fn
         self.isLoaded = true
     }
 
     public func unloadResources() {
-        function = nil
+        functionCache.removeAll()
         model = nil
         isLoaded = false
     }
 
+    /// Whether the model asset contains a function with the given name.
+    /// Loads the model on first use and caches the resolved function.
+    public func hasFunction(named name: String) async throws -> Bool {
+        try await functionIfPresent(named: name) != nil
+    }
+
     // MARK: - [Float]-based API
 
-    public func run(floatInputs: [([Float], [Int])]) async throws -> [Float] {
-        let fn = try await ensureLoaded()
+    /// Run an optional named function (e.g. "rope") with int32 inputs.
+    /// Returns nil if the function doesn't exist in the model asset.
+    public func runNamedFunction(
+        _ name: String, intInputs: [([Int32], [Int])]
+    ) async throws -> [String: [Float]]? {
+        guard let fn = try await functionIfPresent(named: name) else { return nil }
+
+        var namedInputs: [String: NDArray] = [:]
+        for (i, inputName) in fn.descriptor.inputNames.enumerated() where i < intInputs.count {
+            let (data, shape) = intInputs[i]
+            guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: inputName) else { continue }
+            let resolved = nd.resolvingDynamicDimensions(shape)
+            var array = NDArray(descriptor: resolved)
+            var view = array.mutableView(as: Int32.self)
+            view.withUnsafeMutablePointer { ptr, _, _ in
+                for j in 0..<data.count { ptr[j] = data[j] }
+            }
+            namedInputs[inputName] = array
+        }
+
+        return try await encodeAndSyncAll(fn: fn, inputs: namedInputs)
+    }
+
+    public func run(floatInputs: [([Float], [Int])], functionName: String = "main") async throws -> [Float] {
+        let fn = try await function(named: functionName)
 
         var namedInputs: [String: NDArray] = [:]
         for (i, name) in fn.descriptor.inputNames.enumerated() where i < floatInputs.count {
@@ -128,8 +159,27 @@ public actor CoreAIDiffusionModelFunction {
     // MARK: - Core inference
 
     private func ensureLoaded() async throws -> InferenceFunction {
-        if function == nil { try await loadResources() }
-        guard let fn = function else { throw CoreAIDiffusionError.notLoaded }
+        try await function(named: "main")
+    }
+
+    /// Return the named InferenceFunction, loading the model and caching the
+    /// function on first use. Throws if the function is absent from the asset.
+    private func function(named name: String) async throws -> InferenceFunction {
+        guard let fn = try await functionIfPresent(named: name) else {
+            throw CoreAIDiffusionError.functionNotFound(name, modelURL)
+        }
+        return fn
+    }
+
+    /// Like `function(named:)` but returns nil (instead of throwing) when the
+    /// function is not present in the model asset.
+    private func functionIfPresent(named name: String) async throws -> InferenceFunction? {
+        if !isLoaded { try await loadResources() }
+        if let cached = functionCache[name] { return cached }
+        guard let mdl = model, let fn = try mdl.loadFunction(named: name) else {
+            return nil
+        }
+        functionCache[name] = fn
         return fn
     }
 

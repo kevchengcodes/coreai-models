@@ -23,6 +23,62 @@ from typing import Any, cast
 import torch
 
 # ---------------------------------------------------------------------------
+# RoPE as exportable model function
+# ---------------------------------------------------------------------------
+
+
+class RoPEEmbeddingsWrapper(torch.nn.Module):
+    """Stateless RoPE computation exportable as a named function in the .aimodel.
+
+    Input: position_ids [S, N_axes] int32
+    Output: (rotary_emb_cos [S, D], rotary_emb_sin [S, D]) where D = sum(axes_dims)
+
+    No learnable weights. Can be exported standalone or as an additional function
+    inside the transformer .aimodel via converter.add_exported_program().
+    """
+
+    def __init__(self, axes_dims: list[int], theta: float = 2000.0) -> None:
+        super().__init__()
+        self.axes_dims = axes_dims
+        self.theta = theta
+
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_parts: list[torch.Tensor] = []
+        sin_parts: list[torch.Tensor] = []
+        for i, dim in enumerate(self.axes_dims):
+            pos = position_ids[:, i].float()
+            inv_freq = 1.0 / (
+                self.theta
+                ** (torch.arange(0, dim, 2, device=pos.device, dtype=torch.float64) / dim)
+            )
+            freqs = torch.outer(pos.double(), inv_freq)
+            cos_parts.append(freqs.cos().repeat_interleave(2, dim=1).float())
+            sin_parts.append(freqs.sin().repeat_interleave(2, dim=1).float())
+        return torch.cat(cos_parts, dim=-1), torch.cat(sin_parts, dim=-1)
+
+
+def dummy_flux2_rope_embeddings(pipe: Any, grid_size: int = 64) -> tuple[torch.Tensor, ...]:
+    """Dummy inputs for RoPE function export."""
+    cfg = pipe.transformer.config
+    axes_dim = list(cfg.axes_dims_rope)
+    num_axes = len(axes_dim)
+    img_seq = grid_size * grid_size
+    txt_seq = 512
+    total_seq = txt_seq + img_seq
+
+    position_ids = torch.zeros(total_seq, num_axes, dtype=torch.int32)
+    for i in range(txt_seq):
+        position_ids[i, num_axes - 1] = i
+    for h in range(grid_size):
+        for w in range(grid_size):
+            idx = txt_seq + h * grid_size + w
+            position_ids[idx, 1] = h
+            position_ids[idx, 2] = w
+
+    return (position_ids,)
+
+
+# ---------------------------------------------------------------------------
 # RoPE pre-computation (outside the exported graph)
 # Core AI graph optimizer corrupts RoPE frequency ops (arange, outer, pow,
 # repeat_interleave) in monolithic 25-block transformers.
@@ -288,3 +344,94 @@ def dummy_flux2_vae_encoder_half(pipe: Any) -> tuple[torch.Tensor, ...]:
 def dummy_flux2_transformer_512(pipe: Any) -> tuple[torch.Tensor, ...]:
     """512×512 (grid=32, seqLen=1024)."""
     return _dummy_flux2_transformer_impl(pipe, grid_size=32)
+
+
+# ---------------------------------------------------------------------------
+# img2img dummy factories — concatenated noise + reference tokens
+# ---------------------------------------------------------------------------
+
+
+def _dummy_flux2_transformer_img2img(
+    pipe: Any, noise_grid: int, ref_grid: int
+) -> tuple[torch.Tensor, ...]:
+    """Build dummy inputs for img2img transformer with concatenated reference tokens.
+
+    The img2img approach concatenates noise tokens + reference tokens along the
+    sequence dimension. The transformer processes the full sequence and we slice
+    off the noise predictions afterward.
+
+    Args:
+        pipe: HF pipeline (for config access).
+        noise_grid: Grid size for noise tokens (64 = 1024×1024).
+        ref_grid: Grid size for reference image tokens (16/32/64 = quarter/half/full).
+    """
+    cfg = pipe.transformer.config
+    dtype = next(pipe.transformer.parameters()).dtype
+    noise_seq = noise_grid * noise_grid
+    ref_seq = ref_grid * ref_grid
+    total_img_seq = noise_seq + ref_seq
+    text_seq = 512
+    axes_dim = list(cfg.axes_dims_rope)
+    theta = cfg.rope_theta if hasattr(cfg, "rope_theta") else 2000.0
+    num_rope_axes = len(axes_dim)
+
+    # Position IDs: text (T=0) + noise (T=0) + reference (T=10)
+    img_ids = torch.zeros(1, total_img_seq, num_rope_axes)
+    # Noise tokens: T=0, spatial grid
+    for h in range(noise_grid):
+        for w in range(noise_grid):
+            idx = h * noise_grid + w
+            img_ids[0, idx, 1] = float(h)
+            img_ids[0, idx, 2] = float(w)
+    # Reference tokens: T=10, spatial grid (subsampled)
+    for h in range(ref_grid):
+        for w in range(ref_grid):
+            idx = noise_seq + h * ref_grid + w
+            img_ids[0, idx, 0] = 10.0  # T=10 offset
+            img_ids[0, idx, 1] = float(h)
+            img_ids[0, idx, 2] = float(w)
+
+    txt_ids = torch.zeros(1, text_seq, num_rope_axes)
+    for i in range(text_seq):
+        txt_ids[0, i, 3] = float(i)
+
+    rotary_cos, rotary_sin = _compute_rope_embeddings(img_ids, txt_ids, axes_dim, theta=theta)
+
+    return (
+        torch.randn(1, total_img_seq, cfg.in_channels, dtype=dtype),
+        torch.randn(1, text_seq, cfg.joint_attention_dim, dtype=dtype),
+        torch.tensor([0.5], dtype=dtype),
+        torch.tensor([1.0], dtype=dtype),
+        rotary_cos,
+        rotary_sin,
+    )
+
+
+def dummy_flux2_transformer_img2img_quarter(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """img2img quarter (1024×1024): 4096 noise + 256 reference = 4352 img tokens."""
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grid=16)
+
+
+def dummy_flux2_transformer_img2img_half(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """img2img half (1024×1024): 4096 noise + 1024 reference = 5120 img tokens."""
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grid=32)
+
+
+def dummy_flux2_transformer_img2img_full(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """img2img full (1024×1024): 4096 noise + 4096 reference = 8192 img tokens."""
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=64, ref_grid=64)
+
+
+def dummy_flux2_transformer_img2img_512_quarter(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """img2img quarter (512×512): 1024 noise + 64 reference = 1088 img tokens."""
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=8)
+
+
+def dummy_flux2_transformer_img2img_512_half(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """img2img half (512×512): 1024 noise + 256 reference = 1280 img tokens."""
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=16)
+
+
+def dummy_flux2_transformer_img2img_512_full(pipe: Any) -> tuple[torch.Tensor, ...]:
+    """img2img full (512×512): 1024 noise + 1024 reference = 2048 img tokens."""
+    return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=32)
