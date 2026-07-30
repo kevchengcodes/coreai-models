@@ -43,10 +43,18 @@ public actor CoreAIDiffusionModelFunction {
         isLoaded = false
     }
 
-    /// Whether the model asset contains a function with the given name.
-    /// Loads the model on first use and caches the resolved function.
+    /// Whether the model asset declares a function with the given name.
+    ///
+    /// Answers from the asset's function table only — it does not resolve the
+    /// function, so no weights are materialized. `loadFunction` would make a
+    /// GPU-resident copy of the entire weight set (3.5 GB for the FLUX.2
+    /// transformer) and hold it for the lifetime of this actor; opening the
+    /// asset alone costs ~100 MB and is released when this returns.
     public func hasFunction(named name: String) async throws -> Bool {
-        try await functionIfPresent(named: name) != nil
+        if let model { return model.functionNames.contains(name) }
+        let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
+        let probe = try await AIModel(contentsOf: modelURL, options: options)
+        return probe.functionNames.contains(name)
     }
 
     // MARK: - [Float]-based API
