@@ -105,6 +105,7 @@ def export_multifunction(
     functions: list[tuple[str, torch.nn.Module, tuple[torch.Tensor, ...]]],
     input_names: tuple[str, ...],
     output_names: tuple[str, ...],
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> AIProgram:
     """Export multiple function variants into a single .aimodel with shared weights.
 
@@ -116,11 +117,20 @@ def export_multifunction(
             The wrapper should be the same nn.Module instance (or share weights).
         input_names: Names for the exported model's inputs (same for all functions).
         output_names: Names for the exported model's outputs (same for all functions).
+        include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
+            information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
+            which embeds minimum debug information and makes the exported asset smaller.
 
     Returns:
         An optimized AIProgram with multiple named functions.
     """
-    converter = coreai_torch.TorchConverter()
+    converter = coreai_torch.TorchConverter(
+        mode=(
+            coreai_torch.TorchConverter.Mode.DEBUG
+            if include_debug_info
+            else coreai_torch.TorchConverter.Mode.RELEASE
+        )
+    )
     coreai_decomp_table = coreai_torch.get_decomp_table()
 
     for name, wrapper, dummy_inputs in functions:

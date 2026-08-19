@@ -108,18 +108,6 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
             results[name] = str(asset_path)
             continue
 
-        logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
-
-        wrapper = spec.wrapper_fn(hf_pipe)
-        dummy_inputs = spec.dummy_fn(hf_pipe)
-
-        program = export_stateless(
-            wrapper,
-            dummy_inputs,
-            spec.input_names,
-            spec.output_names,
-            include_debug_info=config.include_debug_info,
-        )
         if isinstance(spec, MultiFunctionComponentSpec):
             logger.info(
                 f"Exporting {name} -> {spec.asset_name}.aimodel "
@@ -127,7 +115,12 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
             )
             wrapper = spec.wrapper_fn(hf_pipe)
             functions = [(fv.name, wrapper, fv.dummy_fn(hf_pipe)) for fv in spec.functions]
-            program = export_multifunction(functions, spec.input_names, spec.output_names)
+            program = export_multifunction(
+                functions,
+                spec.input_names,
+                spec.output_names,
+                include_debug_info=config.include_debug_info,
+            )
         else:
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")
             wrapper = spec.wrapper_fn(hf_pipe)
@@ -137,6 +130,7 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
                 dummy_inputs,
                 spec.input_names,
                 spec.output_names,
+                include_debug_info=config.include_debug_info,
                 dynamic_shapes=spec.dynamic_shapes,
                 static_shape_configs=spec.static_shape_configs,
             )
